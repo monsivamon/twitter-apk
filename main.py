@@ -7,96 +7,20 @@ import subprocess
 import argparse
 import apkmirror
 import github
+from functools import cmp_to_key
 
 from apkmirror import Version, Variant
 from build_variants import build_apks
 from download_bins import download_apkeditor, download_morphe_cli, download_release_asset
 from utils import panic, merge_apk, publish_release, patch_apk
 
-# APKMirrorからUniversal Bundleを含む最新の有効なリリースを探索して取得する
-def get_latest_valid_release(versions: list[Version]) -> tuple[Version | None, Variant | None]:
-    check_count = 0
-    for i in versions:
-        if i.version.find("release") >= 0:
-            check_count += 1
-            print(f"  -> Checking APKMirror ({check_count}/10): {i.version}")
-            
-            try:
-                variants = apkmirror.get_variants(i)
-            except Exception as e:
-                print(f"  -> Failed to fetch variants: {e}")
-                continue
-
-            for variant in variants:
-                if variant.is_bundle and variant.architecture == "universal":
-                    print(f"  -> [SUCCESS] Universal bundle found in APKMirror: {i.version}")
-                    return i, variant
-            
-            if check_count >= 10:
-                print("  -> [WARNING] Checked top 10 releases but found no universal bundles.")
-                break
-            
-            time.sleep(1)
-                
-    return None, None
-
-# Twitter用のAPKダウンロードからパッチ適用、GitHubリリースまでのパイプラインを実行する
-def process(latest_version: Version, pikoRelease, download_link: Variant):
-    print("\n[STEP 4] Downloading APK and tools...")
-    
-    print(f"  -> Downloading {latest_version.version} bundle from APKMirror...")
-    apkmirror.download_apk(download_link)
-    target_file = "big_file.apkm"
-
-    if not os.path.exists(target_file):
-        panic("  -> [ERROR] Failed to download APK from APKMirror.")
-
-    print("  -> Downloading APKEditor...")
-    download_apkeditor()
-    if not os.path.exists("big_file_merged.apk"):
-        print(f"  -> Merging APK ({target_file} -> big_file_merged.apk)...")
-        merge_apk(target_file)
-    else:
-        print("  -> Merged APK already exists. Skipping merge.")
-
-    print("\n[STEP 5] Preparing Morphe CLI...")
-    download_morphe_cli()
-    
-    message: str = f"""
-Changelogs:
-[piko-{pikoRelease["tag_name"]}]({pikoRelease["html_url"]})
-"""
-
-    print(f"\n[STEP 6] Building patched APKs (Target: {latest_version.version})...")
-    build_apks(latest_version)
-
-    print("\n[STEP 7] Publishing release to GitHub...")
-    publish_release(
-        latest_version.version,
-        [
-            f"x-piko-v{latest_version.version}.apk",
-            f"x-piko-material-you-v{latest_version.version}.apk",
-            f"twitter-piko-v{latest_version.version}.apk",
-            f"twitter-piko-material-you-v{latest_version.version}.apk",
-        ],
-        message,
-        latest_version.version
-    )
-    print("  -> [DONE] Release successfully published.")
-
-# GitHubリリースの本文から適用されたPikoパッチのバージョンを抽出する
-def extract_piko_version(body: str) -> str | None:
-    m = re.search(r"piko-(v[\w\.\-]+)", body, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return None
-
 # バージョン文字列を数値的に比較し、v1がv2より新しい場合にTrueを返す
-def version_greater(v1: str, v2: str) -> bool:
-    print(f"  -> [DEBUG] Comparing: '{v1}' vs '{v2}'")
-
+def version_greater(v1: str | None, v2: str | None) -> bool:
+    if not v1: return False
+    if not v2: return True
     def normalize(v: str):
-        v = v.lstrip('v')
+        # piko v3.3.0 や piko-v3.3.0 などのプレフィックスを取り除く
+        v = v.replace("piko-", "").replace("piko ", "").lstrip('v')
         parts = v.split('-', 1)
         main_part = parts[0]
         prerelease_part = parts[1] if len(parts) > 1 else ""
@@ -130,7 +54,168 @@ def version_greater(v1: str, v2: str) -> bool:
 
     return len(pre1) > len(pre2)
 
-# Instagram用の対象バージョン判定、APK取得、パッチ適用、リリース追記を実行する
+# GitHubリポジトリからリリース一覧を取得し、StableとPreの最新版を返す
+def get_latest_releases(repo: str, is_my_repo: bool = False) -> dict:
+    cmd = ["gh", "api", f"repos/{repo}/releases?per_page=30"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        releases = json.loads(result.stdout)
+    except Exception as e:
+        print(f"  -> [WARNING] Failed to fetch releases for {repo}: {e}")
+        return {"stable": None, "pre": None}
+        
+    valid_stable = []
+    valid_pre = []
+
+    for r in releases:
+        tag = r.get("tag_name")
+        is_pre = r.get("prerelease", False)
+        
+        # 自分のリポジトリの場合は「piko」で始まるタグのみを追跡対象とする
+        if is_my_repo and not tag.startswith("piko"):
+            continue
+
+        if is_pre or "dev" in tag.lower() or "alpha" in tag.lower() or "beta" in tag.lower():
+            valid_pre.append(tag)
+        else:
+            valid_stable.append(tag)
+
+    def cmp_versions(v1, v2):
+        if v1 == v2: return 0
+        return 1 if version_greater(v1, v2) else -1
+
+    if valid_stable:
+        valid_stable.sort(key=cmp_to_key(cmp_versions), reverse=True)
+    if valid_pre:
+        valid_pre.sort(key=cmp_to_key(cmp_versions), reverse=True)
+
+    return {
+        "stable": valid_stable[0] if valid_stable else None,
+        "pre": valid_pre[0] if valid_pre else None
+    }
+
+# PikoのJSONからTwitterの対象バージョン（Beta/Alpha除外）を抽出する
+def get_twitter_target_version(is_pre: bool) -> str | None:
+    branch = "dev" if is_pre else "main"
+    url = f"https://raw.githubusercontent.com/crimera/piko/refs/heads/{branch}/patches-list.json"
+    print(f"  -> Fetching {url} for Twitter targets...")
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            patches_list = data.get("patches", []) if isinstance(data, dict) else data
+            
+            versions_set = set()
+            for patch in patches_list:
+                compat = patch.get("compatiblePackages")
+                if isinstance(compat, list):
+                    for pkg in compat:
+                        if isinstance(pkg, dict) and pkg.get("packageName") == "com.twitter.android":
+                            targets = pkg.get("targets", [])
+                            for t in targets:
+                                ver = t.get("version")
+                                is_exp = t.get("isExperimental", False)
+                                # isExperimentalがFalse、かつalphaやbetaを含まないものを抽出
+                                if ver and not is_exp:
+                                    vl = ver.lower()
+                                    if "alpha" not in vl and "beta" not in vl:
+                                        versions_set.add(ver)
+            
+            if versions_set:
+                # 複数ある場合は「-release」が含まれるものを優先
+                release_versions = [v for v in versions_set if "-release" in v.lower()]
+                target_list = release_versions if release_versions else list(versions_set)
+                
+                def parse_ver(v):
+                    return [int(x) for x in re.findall(r'\d+', v)]
+                
+                target_twitter_version = sorted(target_list, key=parse_ver)[-1]
+                print(f"  -> Targeted Twitter Version: {target_twitter_version}")
+                return target_twitter_version
+            else:
+                print("  -> [WARNING] No valid stable Twitter target found.")
+                return None
+    except Exception as e:
+        print(f"  -> [WARNING] Failed to parse patches-list.json for Twitter: {e}")
+        return None
+
+# APKMirrorからUniversal Bundleを含む最新の有効なリリースを探索して取得する
+def get_latest_valid_release(versions: list[Version], target_version: str = None) -> tuple[Version | None, Variant | None]:
+    check_count = 0
+    clean_target = target_version.split('-')[0] if target_version else None
+
+    for i in versions:
+        if clean_target and clean_target not in i.version:
+            continue
+
+        if clean_target or i.version.find("release") >= 0:
+            check_count += 1
+            print(f"  -> Checking APKMirror ({check_count}/10): {i.version}")
+            
+            try:
+                variants = apkmirror.get_variants(i)
+            except Exception as e:
+                print(f"  -> Failed to fetch variants: {e}")
+                continue
+
+            for variant in variants:
+                if variant.is_bundle and variant.architecture == "universal":
+                    print(f"  -> [SUCCESS] Universal bundle found in APKMirror: {i.version}")
+                    return i, variant
+            
+            if check_count >= 10:
+                print("  -> [WARNING] Checked top 10 releases but found no universal bundles.")
+                break
+            
+            time.sleep(1)
+                
+    return None, None
+
+# Twitter用のAPKダウンロードからパッチ適用、GitHubリリースまでのパイプラインを実行する
+def process(latest_version: Version, pikoRelease, download_link: Variant, release_tag: str):
+    print("\n[STEP] Downloading APK and tools...")
+    
+    print(f"  -> Downloading {latest_version.version} bundle from APKMirror...")
+    apkmirror.download_apk(download_link)
+    target_file = "big_file.apkm"
+
+    if not os.path.exists(target_file):
+        panic("  -> [ERROR] Failed to download APK from APKMirror.")
+
+    print("  -> Downloading APKEditor...")
+    download_apkeditor()
+    if not os.path.exists("big_file_merged.apk"):
+        print(f"  -> Merging APK ({target_file} -> big_file_merged.apk)...")
+        merge_apk(target_file)
+    else:
+        print("  -> Merged APK already exists. Skipping merge.")
+
+    print("\n[STEP] Preparing Morphe CLI...")
+    download_morphe_cli()
+    
+    message: str = f"""
+Changelogs:
+[piko-{pikoRelease["tag_name"]}]({pikoRelease["html_url"]})
+"""
+
+    print(f"\n[STEP] Building patched APKs (Target: {latest_version.version})...")
+    build_apks(latest_version)
+
+    print("\n[STEP] Publishing release to GitHub...")
+    publish_release(
+        release_tag,
+        [
+            f"x-piko-v{latest_version.version}.apk",
+            f"x-piko-material-you-v{latest_version.version}.apk",
+            f"twitter-piko-v{latest_version.version}.apk",
+            f"twitter-piko-material-you-v{latest_version.version}.apk",
+        ],
+        message,
+        release_tag
+    )
+    print("  -> [DONE] Release successfully published.")
+
+# Instagram用の対象バージョン判定、APK取得、パッチ適用、リリース追記を実行する (既存のまま)
 def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool = False):
     print(f"\n=======================================================")
     print(f"[STEP 8] INITIATING INSTAGRAM BUILD PIPELINE")
@@ -279,8 +364,9 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
         if not compat: 
             supports = True
         elif isinstance(compat, dict) and "com.instagram.android" in compat:
-            versions = compat["com.instagram.android"]
-            if not versions or final_insta_ver in versions: supports = True
+            if compat["com.instagram.android"]:
+                versions = compat["com.instagram.android"]
+                if not versions or final_insta_ver in versions: supports = True
         elif isinstance(compat, list):
             for pkg in compat:
                 if isinstance(pkg, dict) and pkg.get("name") == "com.instagram.android":
@@ -324,71 +410,76 @@ def main():
     parser.add_argument("--app", choices=["twitter", "instagram", "all"], default="all", help="Which app to build")
     args = parser.parse_args()
 
-    url: str = "https://www.apkmirror.com/apk/x-corp/twitter/"
-    repo_url: str = "monsivamon/twitter-apk"
+    repo_url = "monsivamon/twitter-apk"
+    upstream_repo = "crimera/piko"
 
-    print(f"\n[STEP 1] Scanning APKMirror for the latest release... (Mode: {args.app.upper()})")
-    versions = apkmirror.get_versions(url)
-    latest_version, bundle_variant = get_latest_valid_release(versions)
+    print("\n[STEP 1] Fetching release history for upstream and my repo...")
+    upstream = get_latest_releases(upstream_repo)
+    my_repo = get_latest_releases(repo_url, is_my_repo=True)
     
-    if latest_version is None or bundle_variant is None:
-        print("\n  -> [EXIT] Critical Failure: No valid universal release found from APKMirror.")
-        return
+    print("\n--- VERSION STATUS ---")
+    print(f"Upstream Stable: {upstream['stable']}")
+    print(f"Upstream Pre   : {upstream['pre']}")
+    print(f"My Repo  Stable: {my_repo['stable']}")
+    print(f"My Repo  Pre   : {my_repo['pre']}")
+    print("----------------------\n")
 
-    final_apk = latest_version.version
-
-    print("\n[STEP 2] Fetching the latest Piko patches from GitHub...")
-    pikoRelease = download_release_asset(
-        "crimera/piko",
-        r".*\.mpp$",
-        "bins",
-        "patches.mpp",
-        include_prereleases=True
-    )
-    final_piko = pikoRelease["tag_name"]
-    print(f"  -> Latest Piko patch: {final_piko}")
-
-    print("\n[STEP 3] Verifying build history for updates...")
-    last_build_version: github.GithubRelease | None = github.get_last_build_version(repo_url)
-
-    if last_build_version is None:
-        print("  -> No previous release found. Treating as initial build.")
-        if args.app in ["twitter", "all"]:
-            process(latest_version, pikoRelease, bundle_variant)
-        if args.app in ["instagram", "all"]:
-            check_and_build_instagram(latest_version.version, pikoRelease, force=True)
-        return
-
-    last_ver_apk = last_build_version.tag_name
-    last_ver_piko = extract_piko_version(last_build_version.body or "")
+    print("[STEP 2] Verifying build history for updates...")
+    build_targets = []
     
-    print(f"  -> Target APK: {final_apk}")
-    print(f"  -> Target Piko: {final_piko}")
-    print(f"  -> Previous Build APK: {last_ver_apk}")
-    print(f"  -> Previous Build Piko: {last_ver_piko}")
-    
-    apk_is_new = version_greater(final_apk, last_ver_apk)
-
-    if last_ver_piko is None:
-        print("  -> Previous Piko version is unknown. Treating as new.")
-        piko_is_new = True
-    else:
-        piko_is_new = version_greater(final_piko, last_ver_piko)
-
-    target_tag = final_apk if apk_is_new else last_ver_apk
-
-    if args.app in ["twitter", "all"]:
-        if apk_is_new or piko_is_new:
-            print("\n  -> [RESULT] Update detected! Initiating Twitter build sequence.")
-            process(latest_version, pikoRelease, bundle_variant)
-        else:
-            print("\n  -> [SKIP] No updates for APK or Piko. Skipping Twitter build.")
-    else:
-        print(f"\n  -> [SKIP] Twitter build bypassed by --app {args.app} argument.")
+    if upstream["stable"] and version_greater(upstream["stable"], my_repo["stable"]):
+        build_targets.append({"tag": upstream["stable"], "is_pre": False})
         
-    if args.app in ["instagram", "all"]:
-        force_insta = piko_is_new or (args.app == "instagram")
-        check_and_build_instagram(target_tag, pikoRelease, force=force_insta)
+    if upstream["pre"] and version_greater(upstream["pre"], my_repo["pre"]):
+        build_targets.append({"tag": upstream["pre"], "is_pre": True})
+
+    if not build_targets:
+        print("  -> [EXIT] No new updates found. Skipping build.")
+        return
+
+    print(f"  -> [RESULT] Found {len(build_targets)} pending update(s).")
+    
+    for target in build_targets:
+        piko_tag = target["tag"]
+        is_pre = target["is_pre"]
+        
+        # 形式を「piko v3.3.0」などに指定
+        release_tag = f"piko {piko_tag.lstrip('v')}" if "v" in piko_tag else f"piko {piko_tag}"
+        # もし元が piko-v3.3.0 なら上流タグがv3.3.0であることを想定
+        if piko_tag.startswith("v"):
+            release_tag = f"piko {piko_tag}"
+
+        print(f"\n=======================================================")
+        print(f"INITIATING BUILD PIPELINE FOR: {release_tag} ({args.app.upper()})")
+        print(f"=======================================================")
+
+        print("\n[STEP 3] Fetching the latest Piko patches from GitHub...")
+        pikoRelease = download_release_asset(
+            upstream_repo,
+            r".*\.mpp$",
+            "bins",
+            "patches.mpp",
+            include_prereleases=is_pre,
+            version=piko_tag
+        )
+
+        if args.app in ["twitter", "all"]:
+            print("\n[STEP 3.5] Resolving supported Twitter versions from Piko JSON...")
+            target_twitter_version = get_twitter_target_version(is_pre)
+            
+            if target_twitter_version:
+                url = "https://www.apkmirror.com/apk/x-corp/twitter/"
+                print(f"\n[STEP 4] Scanning APKMirror for target release...")
+                versions = apkmirror.get_versions(url)
+                latest_version, bundle_variant = get_latest_valid_release(versions, target_twitter_version)
+                
+                if latest_version and bundle_variant:
+                    process(latest_version, pikoRelease, bundle_variant, release_tag)
+                else:
+                    print("  -> [WARNING] Valid release not found on APKMirror.")
+        
+        if args.app in ["instagram", "all"]:
+            check_and_build_instagram(release_tag, pikoRelease, force=True)
 
 if __name__ == "__main__":
     main()
