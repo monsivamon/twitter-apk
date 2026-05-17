@@ -19,7 +19,6 @@ def version_greater(v1: str | None, v2: str | None) -> bool:
     if not v1: return False
     if not v2: return True
     def normalize(v: str):
-        # piko v3.3.0 や piko-v3.3.0 などのプレフィックスを取り除く
         v = v.replace("piko-", "").replace("piko ", "").lstrip('v')
         parts = v.split('-', 1)
         main_part = parts[0]
@@ -71,7 +70,6 @@ def get_latest_releases(repo: str, is_my_repo: bool = False) -> dict:
         tag = r.get("tag_name")
         is_pre = r.get("prerelease", False)
         
-        # 自分のリポジトリの場合は「piko」で始まるタグのみを追跡対象とする
         if is_my_repo and not tag.startswith("piko"):
             continue
 
@@ -115,14 +113,12 @@ def get_twitter_target_version(is_pre: bool) -> str | None:
                             for t in targets:
                                 ver = t.get("version")
                                 is_exp = t.get("isExperimental", False)
-                                # isExperimentalがFalse、かつalphaやbetaを含まないものを抽出
                                 if ver and not is_exp:
                                     vl = ver.lower()
                                     if "alpha" not in vl and "beta" not in vl:
                                         versions_set.add(ver)
             
             if versions_set:
-                # 複数ある場合は「-release」が含まれるものを優先
                 release_versions = [v for v in versions_set if "-release" in v.lower()]
                 target_list = release_versions if release_versions else list(versions_set)
                 
@@ -138,38 +134,6 @@ def get_twitter_target_version(is_pre: bool) -> str | None:
     except Exception as e:
         print(f"  -> [WARNING] Failed to parse patches-list.json for Twitter: {e}")
         return None
-
-# APKMirrorからUniversal Bundleを含む最新の有効なリリースを探索して取得する
-def get_latest_valid_release(versions: list[Version], target_version: str = None) -> tuple[Version | None, Variant | None]:
-    check_count = 0
-    clean_target = target_version.split('-')[0] if target_version else None
-
-    for i in versions:
-        if clean_target and clean_target not in i.version:
-            continue
-
-        if clean_target or i.version.find("release") >= 0:
-            check_count += 1
-            print(f"  -> Checking APKMirror ({check_count}/10): {i.version}")
-            
-            try:
-                variants = apkmirror.get_variants(i)
-            except Exception as e:
-                print(f"  -> Failed to fetch variants: {e}")
-                continue
-
-            for variant in variants:
-                if variant.is_bundle and variant.architecture == "universal":
-                    print(f"  -> [SUCCESS] Universal bundle found in APKMirror: {i.version}")
-                    return i, variant
-            
-            if check_count >= 10:
-                print("  -> [WARNING] Checked top 10 releases but found no universal bundles.")
-                break
-            
-            time.sleep(1)
-                
-    return None, None
 
 # Twitter用のAPKダウンロードからパッチ適用、GitHubリリースまでのパイプラインを実行する
 def process(latest_version: Version, pikoRelease, download_link: Variant, release_tag: str):
@@ -215,7 +179,7 @@ Changelogs:
     )
     print("  -> [DONE] Release successfully published.")
 
-# Instagram用の対象バージョン判定、APK取得、パッチ適用、リリース追記を実行する (既存のまま)
+# Instagram用の対象バージョン判定、APK取得、パッチ適用、リリース追記を実行する
 def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool = False):
     print(f"\n=======================================================")
     print(f"[STEP 8] INITIATING INSTAGRAM BUILD PIPELINE")
@@ -252,7 +216,7 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
         print(f"  -> [ERROR] Failed to load patches-list.json: {e}")
         return
 
-    print("\n[STEP 8.3] Resolving supported Instagram versions...")
+    print("\n[STEP 8.3] Resolving supported Instagram versions (New JSON Format)...")
     versions_set = set()
     for patch in patches_list:
         compat = patch.get("compatiblePackages")
@@ -260,8 +224,14 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
             if compat["com.instagram.android"]: versions_set.update(compat["com.instagram.android"])
         elif isinstance(compat, list):
             for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("name") == "com.instagram.android":
+                # 新JSONに対応: name -> packageName, versions -> targets
+                if isinstance(pkg, dict) and pkg.get("packageName") == "com.instagram.android":
                     if pkg.get("versions"): versions_set.update(pkg.get("versions"))
+                    if pkg.get("targets"):
+                        for t in pkg.get("targets"):
+                            ver = t.get("version")
+                            if ver and not t.get("isExperimental", False):
+                                versions_set.add(ver)
     
     if not versions_set:
         print("  -> [ERROR] No supported versions found for Instagram.")
@@ -279,13 +249,11 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
         print(f"\n  -> [FALLBACK ROUTINE] Trying to fetch Instagram v{version}...")
         
         slug = version.replace('.', '-')
-        
-        # ターゲット
         target_url = f"https://www.apkmirror.com/apk/instagram/instagram-instagram/instagram-{slug}-release/"
         
         variants = []
         print(f"  -> Targeting Exact URL: {target_url}")
-        time.sleep(2) # Cloudflareの警戒を避けるため少し待機
+        time.sleep(2) 
         
         try:
             tv = Version(version=version, link=target_url)
@@ -294,14 +262,13 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
                 print(f"  -> [SUCCESS] Hit direct URL and found {len(variants)} variants!")
         except Exception as e:
             print(f"  -> [FAILED] {e}")
-            time.sleep(3) # 弾かれたら少し休む
+            time.sleep(3) 
         
         if not variants:
             print(f"  -> [SKIP] No variants found for v{version}.")
             continue
             
         target_variant = None
-        # 1. 優先: BUNDLE版 (arm64 または nodpi)
         for v in variants:
             if getattr(v, 'is_bundle', False):
                 arch = getattr(v, 'architecture', '').lower()
@@ -309,7 +276,6 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
                 if "arm64" in arch or "universal" in arch or "nodpi" in arch or "120-640" in dpi:
                     target_variant = v
                     break
-        # 2. 次点: 通常のAPK版
         if not target_variant:
             for v in variants:
                 if not getattr(v, 'is_bundle', False):
@@ -318,7 +284,6 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
                     if "arm64" in arch or "universal" in arch or "nodpi" in arch or "120-640" in dpi:
                         target_variant = v
                         break
-        # 3. 妥協: 最初に見つかったもの
         if not target_variant:
             target_variant = variants[0]
 
@@ -335,14 +300,12 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
             apkmirror.download_apk(target_variant, path=filepath)
             if os.path.exists(filepath):
                 print(f"  -> [SUCCESS] Downloaded Instagram base APK for v{version}")
-                
                 if getattr(target_variant, 'is_bundle', False):
                     print("  -> Merging Instagram APKM bundle...")
                     merge_apk(filepath)
                     insta_base_apk_to_patch = merged_filepath
                 else:
                     insta_base_apk_to_patch = filepath
-                    
                 final_insta_ver = version
                 break
         except Exception as e:
@@ -369,9 +332,17 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
                 if not versions or final_insta_ver in versions: supports = True
         elif isinstance(compat, list):
             for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("name") == "com.instagram.android":
-                    versions = pkg.get("versions", [])
-                    if not versions or final_insta_ver in versions: supports = True
+                # 🚀 新JSONに対応
+                if isinstance(pkg, dict) and pkg.get("packageName") == "com.instagram.android":
+                    extracted_versions = set()
+                    if pkg.get("versions"): extracted_versions.update(pkg.get("versions"))
+                    if pkg.get("targets"):
+                        for t in pkg.get("targets"):
+                            ver = t.get("version")
+                            if ver and not t.get("isExperimental", False):
+                                extracted_versions.add(ver)
+                    if not extracted_versions or final_insta_ver in extracted_versions:
+                        supports = True
                     break
         if supports:
             insta_patches.append(patch_name)
@@ -443,9 +414,7 @@ def main():
         piko_tag = target["tag"]
         is_pre = target["is_pre"]
         
-        # 形式を「piko v3.3.0」などに指定
         release_tag = f"piko {piko_tag.lstrip('v')}" if "v" in piko_tag else f"piko {piko_tag}"
-        # もし元が piko-v3.3.0 なら上流タグがv3.3.0であることを想定
         if piko_tag.startswith("v"):
             release_tag = f"piko {piko_tag}"
 
@@ -468,15 +437,42 @@ def main():
             target_twitter_version = get_twitter_target_version(is_pre)
             
             if target_twitter_version:
-                url = "https://www.apkmirror.com/apk/x-corp/twitter/"
-                print(f"\n[STEP 4] Scanning APKMirror for target release...")
-                versions = apkmirror.get_versions(url)
-                latest_version, bundle_variant = get_latest_valid_release(versions, target_twitter_version)
-                
-                if latest_version and bundle_variant:
-                    process(latest_version, pikoRelease, bundle_variant, release_tag)
+                print(f"\n[STEP 4] Fetching Twitter base APK for v{target_twitter_version} (Direct Sniper Mode)...")
+                # 🚀 トップページ検索を廃止し、直接URLを推測して取得するスナイパーモードに変更
+                slug1 = target_twitter_version.replace('.', '-')
+                slug2 = target_twitter_version.split('-')[0].replace('.', '-')
+                urls_to_try = [
+                    f"https://www.apkmirror.com/apk/x-corp/twitter/twitter-{slug1}-release/",
+                    f"https://www.apkmirror.com/apk/x-corp/twitter/twitter-{slug2}-release/"
+                ]
+
+                target_variant = None
+                tv = None
+                for url in urls_to_try:
+                    print(f"  -> Targeting URL: {url}")
+                    tv = Version(version=target_twitter_version, link=url)
+                    try:
+                        variants = apkmirror.get_variants(tv)
+                        if variants:
+                            for v in variants:
+                                if getattr(v, 'is_bundle', False):
+                                    arch = getattr(v, 'architecture', '').lower()
+                                    if "universal" in arch or "arm64" in arch or "nodpi" in arch:
+                                        target_variant = v
+                                        break
+                            if target_variant:
+                                print(f"  -> [SUCCESS] Found universal bundle variant!")
+                                break
+                    except Exception as e:
+                        print(f"  -> [FAILED] {e}")
+                    time.sleep(2)
+
+                if target_variant and tv:
+                    process(tv, pikoRelease, target_variant, release_tag)
                 else:
                     print("  -> [WARNING] Valid release not found on APKMirror.")
+            else:
+                print("  -> [WARNING] Could not resolve target Twitter version.")
         
         if args.app in ["instagram", "all"]:
             check_and_build_instagram(release_tag, pikoRelease, force=True)
