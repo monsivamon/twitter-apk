@@ -5,6 +5,7 @@ import json
 import urllib.request
 import subprocess
 import argparse
+import shutil
 import apkmirror
 import github
 from functools import cmp_to_key
@@ -224,7 +225,6 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
             if compat["com.instagram.android"]: versions_set.update(compat["com.instagram.android"])
         elif isinstance(compat, list):
             for pkg in compat:
-                # 新JSONに対応: name -> packageName, versions -> targets
                 if isinstance(pkg, dict) and pkg.get("packageName") == "com.instagram.android":
                     if pkg.get("versions"): versions_set.update(pkg.get("versions"))
                     if pkg.get("targets"):
@@ -332,7 +332,6 @@ def check_and_build_instagram(release_tag: str, pikoRelease: dict, force: bool =
                 if not versions or final_insta_ver in versions: supports = True
         elif isinstance(compat, list):
             for pkg in compat:
-                # 🚀 新JSONに対応
                 if isinstance(pkg, dict) and pkg.get("packageName") == "com.instagram.android":
                     extracted_versions = set()
                     if pkg.get("versions"): extracted_versions.update(pkg.get("versions"))
@@ -438,12 +437,13 @@ def main():
             
             if target_twitter_version:
                 print(f"\n[STEP 4] Fetching Twitter base APK for v{target_twitter_version} (Direct Sniper Mode)...")
-                # 🚀 トップページ検索を廃止し、直接URLを推測して取得するスナイパーモードに変更
                 slug1 = target_twitter_version.replace('.', '-')
                 slug2 = target_twitter_version.split('-')[0].replace('.', '-')
+                
+                # 古いtwitter-のフォールバックは不要なため削除し、x- から始まるものだけに限定
                 urls_to_try = [
-                    f"https://www.apkmirror.com/apk/x-corp/twitter/twitter-{slug1}-release/",
-                    f"https://www.apkmirror.com/apk/x-corp/twitter/twitter-{slug2}-release/"
+                    f"https://www.apkmirror.com/apk/x-corp/twitter/x-{slug1}-release/",
+                    f"https://www.apkmirror.com/apk/x-corp/twitter/x-{slug2}-release/"
                 ]
 
                 target_variant = None
