@@ -106,59 +106,6 @@ def get_latest_piko_tag(is_pre: bool) -> str:
         print(f"  -> [WARNING] Failed to fetch latest release tag: {e}. Falling back to v1.0.0.")
         return "v1.0.0"
 
-# Piko のブランチからパッチ定義 JSON をダウンロードする
-def fetch_patches_json(is_pre: bool) -> list:
-    branch = "dev" if is_pre else "main"
-    url = f"https://raw.githubusercontent.com/crimera/piko/refs/heads/{branch}/patches-list.json"
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            patches = data.get("patches", []) if isinstance(data, dict) else data
-            print(f"  -> [DEBUG] Loaded {len(patches)} patch definitions.")
-            return patches
-    except Exception as e:
-        print(f"  -> [WARNING] Failed to load patches JSON: {e}")
-        return []
-
-# 指定されたパッケージとバージョンに互換性のあるパッチだけを抽出する
-def get_patches_for_version(patches_list: list, package_name: str, target_version: str) -> list:
-    patches = []
-    clean_version_match = re.search(r'^([\d.]+)', target_version)
-    clean_version = clean_version_match.group(1).strip('.') if clean_version_match else target_version
-    
-    print(f"  -> [DEBUG] Filtering patches for Package: '{package_name}', Version: '{clean_version}'")
-
-    for patch in patches_list:
-        patch_name = patch.get("name")
-        compat = patch.get("compatiblePackages")
-        supports_version = False
-
-        if not compat: 
-            supports_version = True
-        elif isinstance(compat, list):
-            for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("packageName") == package_name:
-                    extracted_versions = set()
-                    if pkg.get("versions"): extracted_versions.update(pkg.get("versions"))
-                    if pkg.get("targets"):
-                        for t in pkg.get("targets"):
-                            ver = t.get("version")
-                            if ver: extracted_versions.add(ver)
-                    if not extracted_versions or clean_version in extracted_versions:
-                        supports_version = True
-                    break
-        elif isinstance(compat, dict) and package_name in compat:
-            versions = compat[package_name]
-            if not versions or clean_version in versions:
-                supports_version = True
-
-        if supports_version:
-            patches.append(patch_name)
-            
-    print(f"  -> [DEBUG] Found {len(patches)} compatible patches.")
-    return patches
-
 # ファイル名からバージョン文字列を抽出する
 def extract_version_from_filename(filename: str) -> str:
     match = re.search(r'(\d+\.\d+\.\d+[-a-zA-Z0-9.]*)', filename)
@@ -172,6 +119,67 @@ def extract_version_from_filename(filename: str) -> str:
         return parsed
     print(f"  -> [DEBUG] Could not extract version from '{filename}'. Using 'local'.")
     return "local"
+
+# =====================================================================
+#  CLIのテキスト出力を解析し、指定パッケージ用のパッチリストを生成する共通関数
+# =====================================================================
+def get_target_patches(cli_path: str, mpp_path: str, target_package: str, excludes: list = None) -> list:
+    if excludes is None:
+        excludes = []
+        
+    print(f"  -> Extracting patch list dynamically for '{target_package}' from {mpp_path} via CLI...")
+    
+    cmd = ["java", "-jar", cli_path, "list-patches", f"--patches={mpp_path}", "-p"]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"  -> [FATAL] Failed to extract patches from CLI. Error: {e.stderr}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"  -> [FATAL] Failed to execute CLI command. Error: {e}")
+        sys.exit(1)
+
+    patches = []
+    current_patch = None
+
+    for line in out.splitlines():
+        s_line = line.strip()
+        if not s_line:
+            continue
+
+        if s_line.startswith('Index:'):
+            current_patch = {"name": "", "packages": []}
+            patches.append(current_patch)
+            
+        elif s_line.startswith('Name:') and current_patch is not None:
+            current_patch["name"] = s_line[5:].strip()
+            
+        elif s_line.startswith('Package name:'):
+            pkg_name = s_line.split('Package name:', 1)[1].strip()
+            if current_patch is not None:
+                current_patch["packages"].append(pkg_name)
+
+    applicable_patches = []
+
+    for patch in patches:
+        patch_name = patch["name"]
+        packages = patch["packages"]
+        
+        # Universalパッチ、または指定パッケージ用パッチを抽出
+        is_target_patch = False
+        if not packages:
+            is_target_patch = True
+        elif target_package in packages:
+            is_target_patch = True
+            
+        if is_target_patch:
+            if patch_name not in excludes:
+                applicable_patches.append(patch_name)
+
+    return applicable_patches
+
 
 # 作業ディレクトリを掃除し、一時ファイルやビルド中間生成物を削除する
 def cleanup_workspace(is_initial=False):
@@ -194,7 +202,6 @@ def cleanup_workspace(is_initial=False):
         targets.append(OUTPUT_DIR)
 
     for target in targets:
-        # ワイルドカードがあれば展開、なければそのままリスト
         paths = glob.glob(target) if any(c in target for c in "*?[") else [target]
         for path in paths:
             if os.path.exists(path):
@@ -356,14 +363,15 @@ def main():
     print(f"  -> Target Piko Tag: {piko_tag}")
     download_release_asset("crimera/piko", r".*\.mpp$", "bins", "patches.mpp", include_prereleases=is_pre, version=piko_tag)
     
-    patches_list = fetch_patches_json(is_pre)
-    
     # ステップ2: ビルドツールを準備
     print("\n[STEP 2] Preparing build tools...")
     download_apkeditor()
     download_morphe_cli()
 
     all_generated_assets = []
+    
+    cli_jar = "bins/morphe-cli.jar"
+    patch_mpp = "bins/patches.mpp"
 
     # ベース APK ごとにパッチを適用
     for file_path in base_files:
@@ -395,24 +403,10 @@ def main():
             if os.path.exists(target_merged):
                 print("  -> Building Twitter/X variants...")
                 
-                cli_jar = "bins/morphe-cli.jar"
-                patch_mpp = "bins/patches.mpp"
+                # 共通関数で動的にパッチリストを抽出 ("Bring back twitter"と"Dynamic color"は自動除外)
+                common_includes = get_target_patches(cli_jar, patch_mpp, "com.twitter.android", excludes=["Bring back twitter", "Dynamic color"])
+                print(f"  -> Dynamic common patches extracted: {len(common_includes)} patches")
                 
-                # 共通パッチリスト
-                common_includes = [
-                    "Enable app downgrading",
-                    "Hide FAB",
-                    "Disable chirp font",
-                    "Add ability to copy media link",
-                    "Hide Banner",
-                    "Hide promote button",
-                    "Hide Community Notes",
-                    "Delete from database",
-                    "Customize Navigation Bar items",
-                    "Remove premium upsell",
-                    "Control video auto scroll",
-                    "Force enable translate",
-                ]
                 common_excludes = []
                 
                 # バリアント1: X (Material You)
@@ -480,14 +474,14 @@ def main():
                     shutil.move(working_file, insta_merged)
             
             if os.path.exists(insta_merged):
-                # バージョン互換性のあるパッチを自動抽出
-                insta_patches = get_patches_for_version(patches_list, "com.instagram.android", version_str)
+                # 共通関数でInstagram向けのパッチを動的抽出（除外指定なし）
+                insta_patches = get_target_patches(cli_jar, patch_mpp, "com.instagram.android")
                 print(f"  -> Found {len(insta_patches)} applicable patches.")
                 if insta_patches:
                     print(f"  -> [DEBUG] Patch List: {', '.join(insta_patches)}")
                 
                 out_path = run_morphe_and_extract(
-                    "bins/morphe-cli.jar", "bins/patches.mpp", insta_merged, 
+                    cli_jar, patch_mpp, insta_merged, 
                     f"instagram-piko-{version_str}.apk", insta_patches, []
                 )
                 all_generated_assets.append(out_path)
