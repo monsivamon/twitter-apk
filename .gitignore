@@ -8,3 +8,4 @@ test.py
 .base_apk/
 output_apks/
 bins/
+build_log.txt

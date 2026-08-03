@@ -8,25 +8,68 @@ import subprocess
 import sys
 import time
 
-# ---------------------------------------------------
-# Javaのメモリ不足エラー（OOM）対策として最大ヒープメモリを4GBに拡張
-os.environ["_JAVA_OPTIONS"] = "-Xmx4g"
-# ---------------------------------------------------
+# Delete previous log file if it exists
+LOG_FILENAME = "build_log.txt"
+if os.path.exists(LOG_FILENAME):
+    try:
+        os.remove(LOG_FILENAME)
+    except Exception:
+        pass
 
-# =====================================================================
-#  GitHubリポジトリの構成設定（ビルド成果物の展開先）
-# =====================================================================
+# Redirect stdout and stderr to both console and a log file with Path Sanitization
+class DualLogger:
+    def __init__(self, filename=LOG_FILENAME):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+        
+        # Get absolute paths to mask
+        self.cwd = os.getcwd()
+        self.home = os.path.expanduser("~")
+        
+    def sanitize(self, text):
+        if not isinstance(text, str):
+            return text
+            
+        cwd_b = self.cwd
+        cwd_f = self.cwd.replace("\\", "/")
+        home_b = self.home
+        home_f = self.home.replace("\\", "/")
+
+        # Replace CWD with '.' and Home Dir with '~' (Handle both \ and / slashes)
+        if os.name == 'nt':
+            text = re.sub(re.escape(cwd_b), ".", text, flags=re.IGNORECASE)
+            text = re.sub(re.escape(cwd_f), ".", text, flags=re.IGNORECASE)
+            text = re.sub(re.escape(home_b), "~", text, flags=re.IGNORECASE)
+            text = re.sub(re.escape(home_f), "~", text, flags=re.IGNORECASE)
+        else:
+            text = text.replace(cwd_b, ".").replace(cwd_f, ".")
+            text = text.replace(home_b, "~").replace(home_f, "~")
+            
+        return text
+
+    def write(self, message):
+        clean_message = self.sanitize(message)
+        self.terminal.write(clean_message)
+        self.log.write(clean_message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = DualLogger()
+sys.stderr = sys.stdout
+
+# Increase Java max heap size to 4GB to prevent OOM
+os.environ["_JAVA_OPTIONS"] = "-Xmx4g"
+
+# GitHub repo configuration
 GITHUB_REPO = "monsivamon/twitter-apk"
 
-# =====================================================================
-#  apksignerの絶対パスを格納するグローバル変数
-# =====================================================================
+# Global variable for apksigner path
 APKSIGNER_PATH = None
 
-# =====================================================================
-#  実行環境の依存関係解決処理（Javaおよびapksignerのパス環境変数への追加）
-# =====================================================================
-
+# Ensure Java is in PATH
 def ensure_java_in_path():
     java_home = os.environ.get("JAVA_HOME")
     if java_home and not os.path.exists(java_home):
@@ -55,6 +98,7 @@ def ensure_java_in_path():
 
 ensure_java_in_path()
 
+# Ensure apksigner is in PATH
 def ensure_apksigner_in_path():
     global APKSIGNER_PATH
     existing = shutil.which("apksigner")
@@ -78,7 +122,7 @@ def ensure_apksigner_in_path():
 
 ensure_apksigner_in_path()
 
-# subprocess.runのエンコード問題回避パッチ
+# Patch subprocess.run encoding issues
 original_run = subprocess.run
 def patched_run(*args, **kwargs):
     if kwargs.get("text") is True or kwargs.get("capture_output") is True:
@@ -89,9 +133,7 @@ def patched_run(*args, **kwargs):
 
 subprocess.run = patched_run
 
-# =====================================================================
-#  外部ユーティリティモジュールのインポート
-# =====================================================================
+# Import external utilities
 from download_bins import download_apkeditor, download_morphe_cli, download_release_asset
 from utils import merge_apk
 
@@ -99,6 +141,7 @@ BASE_APK_DIR = ".base_apk"
 OUTPUT_DIR = "output_apks"
 BINS_DIR = "bins"
 
+# Compare versions (greater)
 def is_version_greater_than(ver_str: str, target: str) -> bool:
     try:
         clean_ver = ver_str.split('-')[0]
@@ -113,6 +156,7 @@ def is_version_greater_than(ver_str: str, target: str) -> bool:
     except Exception:
         return False
 
+# Compare versions (less)
 def is_version_less_than(ver_str: str, target: str) -> bool:
     try:
         clean_ver = ver_str.split('-')[0]
@@ -127,6 +171,7 @@ def is_version_less_than(ver_str: str, target: str) -> bool:
     except Exception:
         return False
 
+# Fetch latest Piko release tag
 def get_latest_piko_tag(is_pre: bool) -> str:
     print("  -> Fetching latest Piko release info from GitHub...")
     url = "https://api.github.com/repos/crimera/piko/releases"
@@ -142,13 +187,14 @@ def get_latest_piko_tag(is_pre: bool) -> str:
         print(f"  -> [WARNING] Failed to fetch latest release tag: {e}. Falling back to v1.0.0.")
         return "v1.0.0"
 
+# Download x-shim patch
 def fetch_x_shim():
     shim_path = os.path.join(BINS_DIR, "x-shim.mpp")
     if os.path.exists(shim_path):
         print("  -> [DEBUG] x-shim.mpp already exists. Skipping download.")
         return shim_path
     
-    print("  -> Fetching latest x-shim from GitLab...")
+    print("  -> Fetching latest x-shim release info from GitLab...")
     url = "https://gitlab.com/api/v4/projects/inotia00%2Fx-shim/releases"
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -159,6 +205,7 @@ def fetch_x_shim():
                 return None
             
             latest = releases[0]
+            tag_name = latest.get("tag_name", "Unknown Version")
             download_url = None
             for link in latest.get("assets", {}).get("links", []):
                 if link.get("url", "").endswith(".mpp"):
@@ -169,7 +216,7 @@ def fetch_x_shim():
                 print("  -> [WARNING] Could not find .mpp asset in x-shim release.")
                 return None
                 
-            print(f"  -> Downloading x-shim from {download_url} ...")
+            print(f"  -> [INFO] Downloading x-shim Version: {tag_name}")
             urllib.request.urlretrieve(download_url, shim_path)
             print("  -> [SUCCESS] Downloaded x-shim.mpp")
             return shim_path
@@ -177,6 +224,7 @@ def fetch_x_shim():
         print(f"  -> [WARNING] Failed to fetch x-shim: {e}")
         return None
 
+# Apply x-shim patch to APK
 def apply_shim(cli_jar, shim_mpp, input_apk):
     output_apk = input_apk.replace(".apk", "_shimmed.apk")
     print(f"\n  -> Applying x-shim patch to {input_apk}...")
@@ -215,6 +263,7 @@ def apply_shim(cli_jar, shim_mpp, input_apk):
     print("  -> [FATAL ERROR] Could not find shimmed APK output.")
     sys.exit(1)
 
+# Fetch recent GitHub releases
 def get_recent_github_releases(repo_name: str, limit: int = 10) -> list:
     print(f"  -> Fetching recent releases from {repo_name}...")
     cmd = ["gh", "api", f"repos/{repo_name}/releases?per_page={limit}"]
@@ -227,6 +276,7 @@ def get_recent_github_releases(repo_name: str, limit: int = 10) -> list:
         print(f"  -> [WARNING] Failed to fetch releases from {repo_name}: {e}")
         return []
 
+# Extract version from filename
 def extract_version_from_filename(filename: str) -> str:
     match = re.search(r'(\d+\.\d+\.\d+[-a-zA-Z0-9.]*)', filename)
     if match:
@@ -240,6 +290,7 @@ def extract_version_from_filename(filename: str) -> str:
     print(f"  -> [DEBUG] Could not extract version from '{filename}'. Using 'local'.")
     return "local"
 
+# Extract required patches dynamically
 def get_target_patches(cli_path: str, mpp_path: str, target_package: str, excludes: list | None = None) -> list:
     if excludes is None:
         excludes = []
@@ -296,6 +347,7 @@ def get_target_patches(cli_path: str, mpp_path: str, target_package: str, exclud
 
     return applicable_patches
 
+# Clean up temporary files
 def cleanup_workspace(clean_bins=False, clean_outputs=False):
     print("\n[CLEANUP] Removing temporary files...")
 
@@ -335,6 +387,7 @@ def cleanup_workspace(clean_bins=False, clean_outputs=False):
         
     print("  -> Workspace clean.")
 
+# Check GitHub repository access
 def check_github_repo_access(repo_name):
     print("\n[PRE-CHECK] Verifying GitHub repository access...")
     if not repo_name or "ここ" in repo_name:
@@ -351,6 +404,7 @@ def check_github_repo_access(repo_name):
     print("  -> [SUCCESS] Repository access confirmed.")
     return True
 
+# Upload files to GitHub release
 def upload_to_github_release(piko_tag, file_paths, is_pre, exact_tag=False):
     if not file_paths:
         print("  -> [INFO] No built files to upload.")
@@ -397,6 +451,7 @@ def upload_to_github_release(piko_tag, file_paths, is_pre, exact_tag=False):
     else:
         print(f"  -> [SUCCESS] Created new GitHub Release {tag} and uploaded assets.")
 
+# Run Morphe CLI and extract APK
 def run_morphe_and_extract(cli_jar, patch_mpp, input_apk, output_apk_name, includes, excludes):
     cmd = [
         "java", "-jar", cli_jar, "patch",
@@ -441,6 +496,7 @@ def run_morphe_and_extract(cli_jar, patch_mpp, input_apk, output_apk_name, inclu
         print(f"  -> [FATAL ERROR] Patched file not found at expected location: {cli_output}")
         sys.exit(1)
 
+# Main execution logic
 def main():
     print("\n=======================================================")
     print(" PIKO AUTOMATED LOCAL BUILDER")
@@ -451,8 +507,8 @@ def main():
         return
 
     print("Select start point:")
-    print("  [1] Full Build   (Clean ALL, Download tools, Build, Sign)")
-    print("  [2] Build & Sign (Keep existing tools in 'bins', Build, Sign)")
+    print("  [1] Full Build   (Clean ALL, Download tools, Build, Sign, Upload)")
+    print("  [2] Debug Build  (Clean ALL, Download tools, Build, Sign, NO Upload)")
     print("  [3] Sign Only    (Sign existing APKs from 'output_apks')")
     print("  [4] Upload Only  (Upload existing APKs directly from 'output_apks')")
     mode = input("Enter your choice (1, 2, 3, or 4): ").strip()
@@ -464,6 +520,7 @@ def main():
     is_pre = False
     piko_tag = "v1.0.0"
     target_upload_tag = ""
+    final_upload_tag = ""
 
     if mode in ["1", "2"]:
         print("\nSelect target Piko branch:")
@@ -495,25 +552,24 @@ def main():
         else:
             target_upload_tag = input("Enter target tag manually (e.g., v3.5.0) or leave empty to skip: ").strip()
 
-    cleanup_workspace(clean_bins=(mode == "1"), clean_outputs=(mode in ["1", "2"]))
+    # Clean bins for both mode 1 and 2
+    cleanup_workspace(clean_bins=(mode in ["1", "2"]), clean_outputs=(mode in ["1", "2"]))
 
     if not os.path.exists(BASE_APK_DIR):
         os.makedirs(BASE_APK_DIR)
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    if mode == "1":
+    if mode in ["1", "2"]:
         print("\n[STEP 1] Fetching Piko resources...")
         piko_tag = get_latest_piko_tag(is_pre)
-        print(f"  -> Target Piko Tag: {piko_tag}")
+        print(f"  -> [INFO] Downloading Piko patches Version: {piko_tag}")
         download_release_asset("crimera/piko", r".*\.mpp$", "bins", "patches.mpp", include_prereleases=is_pre, version=piko_tag)
         
         print("\n[STEP 2] Preparing build tools...")
+        print("  -> [INFO] Downloading external build tools (APKEditor, Morphe CLI)...")
         download_apkeditor()
         download_morphe_cli()
-    elif mode == "2":
-        print("\n[STEP 1 & 2] Skipped download. Fetching tag info for release...")
-        piko_tag = get_latest_piko_tag(is_pre)
     elif mode in ["3", "4"]:
         next_action = "Signature" if mode == "3" else "Upload"
         print(f"\n[STEP 1-3] Skipped. Proceeding directly to {next_action} processing.")
@@ -645,9 +701,7 @@ def main():
                         run_morphe_and_extract(cli_jar, patch_mpp, insta_merged, f"instagram-piko-{version_str}.apk", insta_patches, [])
                         print(f"  -> [SUCCESS] Instagram variant saved to '{OUTPUT_DIR}'.")
 
-    # ---------------------------------------------------------
-    # 署名処理
-    # ---------------------------------------------------------
+    # Signature process
     signed_assets = []
     target_apks = glob.glob(os.path.join(OUTPUT_DIR, "*.apk"))
     
@@ -661,7 +715,7 @@ def main():
             if not os.path.exists(ZIPALIGN_PATH):
                 ZIPALIGN_PATH = "zipalign"
             
-            keystore_path = os.path.abspath("ks_pkcs12.keystore")
+            keystore_path = "ks_pkcs12.keystore"  # Force relative path here
             if not os.path.exists(keystore_path):
                 print(f"  -> [ERROR] Keystore file not found at {keystore_path}")
                 sys.exit(1)
@@ -672,7 +726,7 @@ def main():
                     
                 print(f"\n  -> Processing {os.path.basename(apk_path)} ...")
                 
-                # Zipalign（メモリアライメント）
+                # Zipalign
                 print(f"     [1/2] Zipaligning...")
                 temp_aligned = apk_path + ".aligned.apk"
                 align_cmd = [ZIPALIGN_PATH, "-p", "-f", "4", apk_path, temp_aligned]
@@ -686,7 +740,7 @@ def main():
                 except Exception as e:
                     print(f"     [WARNING] Zipalign execution error: {e}")
 
-                # 署名
+                # Signing
                 print(f"     [2/2] Signing with apksigner...")
                 temp_signed = apk_path + ".signed.apk"
                 cmd = [
@@ -728,22 +782,28 @@ def main():
         else:
             print(f"  -> [INFO] No APK files found in '{OUTPUT_DIR}' to upload.")
 
+    # Cleanup at the end (always cleans bins)
     cleanup_workspace(clean_bins=True, clean_outputs=False)
 
     assets_to_upload = [apk for apk in signed_assets if "_merged_unpatched" not in apk]
 
-    if mode in ["1", "2"] and signed_assets:
+    if mode == "1" and signed_assets:
         if assets_to_upload:
             print(f"  -> [DEBUG] Assets to upload: {assets_to_upload}")
             upload_to_github_release(piko_tag, assets_to_upload, is_pre)
+            final_upload_tag = piko_tag if piko_tag.startswith("piko-") else f"piko-{piko_tag}"
         else:
             print("  -> [INFO] No patched APKs found to upload to GitHub.")
+            
+    elif mode == "2":
+        print("\n  -> [INFO] Mode 2 (Debug Build) selected. Skipping GitHub upload.")
             
     elif mode in ["3", "4"] and signed_assets:
         if target_upload_tag:
             if assets_to_upload:
                 print(f"\n  -> [DEBUG] Uploading assets to target release '{target_upload_tag}': {assets_to_upload}")
                 upload_to_github_release(target_upload_tag, assets_to_upload, is_pre=False, exact_tag=True)
+                final_upload_tag = target_upload_tag
             else:
                 print("\n  -> [INFO] No patched APKs found to upload to GitHub.")
         else:
@@ -753,6 +813,15 @@ def main():
     print("\n=======================================================")
     print(" BUILD PIPELINE COMPLETED SUCCESSFULLY")
     print("=======================================================\n")
+
+    # Upload build log to GitHub
+    if final_upload_tag and shutil.which("gh"):
+        print(f"  -> Uploading build_log.txt to release {final_upload_tag}...")
+        sys.stdout.flush()
+        subprocess.run([
+            "gh", "release", "upload", final_upload_tag, LOG_FILENAME, "--clobber", "--repo", GITHUB_REPO
+        ], capture_output=True)
+        print("  -> [SUCCESS] Log file uploaded.")
 
 if __name__ == "__main__":
     main()
