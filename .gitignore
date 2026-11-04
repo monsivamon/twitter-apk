@@ -1,11 +1,11 @@
 .venv
 __pycache__
 test.py
-
-# --- 以下を追加（自動生成される巨大ファイルやツールを無視） ---
 *.apk
 *.apkm
 .base_apk/
 output_apks/
 bins/
 build_log.txt
+all_sources.bat
+all_sources.txt
