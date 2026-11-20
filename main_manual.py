@@ -15,7 +15,9 @@ from build_utils import (
     is_version_greater_than, is_version_less_than,
     get_latest_piko_tag, fetch_x_shim, apply_shim,
     extract_version_from_filename, get_target_patches,
-    run_morphe_and_extract
+    run_morphe_and_extract, fetch_patches_list, get_patch_catalog,
+    get_patch_family_for_version, get_family_patches, is_family_compatible,
+    NEWX_NAME_PREFIX, NEWX_BRANDING_PATCH
 )
 
 BASE_APK_DIR = ".base_apk"
@@ -23,6 +25,58 @@ OUTPUT_DIR = "output_apks"
 BINS_DIR = "bins"
 GITHUB_REPO = gh_utils.GITHUB_REPO
 LOG_FILENAME = "build_log.txt"
+
+# Patches that are toggled per variant (never applied to every variant)
+OLD_TOGGLE_PATCHES = ["Bring back twitter", "Dynamic color"]
+
+def build_twitter_variants(family, version_str):
+    """Variant definitions for the detected patch family."""
+    if family == "newx":
+        return [
+            {"name": "NewX (Standard)", "output": f"newx-piko-v{version_str}.apk", "includes": [], "excludes": [NEWX_BRANDING_PATCH]},
+            {"name": "NewX (Twitter branding)", "output": f"newx-piko-twitter-branding-v{version_str}.apk", "includes": [NEWX_BRANDING_PATCH], "excludes": []},
+        ]
+    return [
+        {"name": "X (Material You)", "output": f"x-piko-material-you-v{version_str}.apk", "includes": ["Dynamic color"], "excludes": []},
+        {"name": "X (Standard)", "output": f"x-piko-v{version_str}.apk", "includes": [], "excludes": ["Dynamic color"]},
+        {"name": "Twitter (Material You)", "output": f"twitter-piko-material-you-v{version_str}.apk", "includes": ["Bring back twitter", "Dynamic color"], "excludes": []},
+        {"name": "Twitter (Standard)", "output": f"twitter-piko-v{version_str}.apk", "includes": ["Bring back twitter"], "excludes": ["Dynamic color"]},
+    ]
+
+def is_twitter_filename(filename):
+    """Detect Twitter/X base APK names (e.g. 'x-12.19.1.apk', 'X 12.43.0.apkm')."""
+    name = filename.lower()
+    return (
+        "twitter" in name
+        or "com.twitter.android" in name
+        or name.startswith(("x-", "x_", "x ", "x."))
+    )
+
+def build_patch_selection(catalog, available, family):
+    """Split available patches into this family's includes and the other family's patches.
+
+    The other family's patches are passed as excludes as well, so Old and NewX
+    can never be applied together even if exclusive includes behave unexpectedly.
+    """
+    if catalog:
+        base_includes = get_family_patches(catalog, family)
+        # Only the other family's own patches: common ones must stay in both.
+        foreign = list(catalog.get("newx" if family == "old" else "old", []))
+    else:
+        # No metadata: fall back to the name prefix heuristic.
+        newx_patches = [p for p in available if p.startswith(NEWX_NAME_PREFIX)]
+        old_patches = [p for p in available if not p.startswith(NEWX_NAME_PREFIX)]
+        if family == "newx":
+            base_includes, foreign = newx_patches, old_patches
+        else:
+            base_includes, foreign = old_patches, newx_patches
+
+    unknown = [p for p in base_includes if p not in available]
+    if unknown:
+        print(f"  -> [WARNING] {len(unknown)} patch(es) from metadata not found in patches.mpp: {', '.join(unknown[:5])}")
+
+    return [p for p in base_includes if p in available], [p for p in foreign if p in available]
+
 
 def cleanup_workspace(clean_bins=False, clean_outputs=False):
     print("\n[CLEANUP] Removing temporary files...")
@@ -71,6 +125,7 @@ def main():
     piko_tag = "v1.0.0"
     target_upload_tag = ""
     final_upload_tag = ""
+    twitter_catalog = None
 
     if mode in ["1", "2"]:
         print("\nSelect target Piko branch:")
@@ -111,7 +166,15 @@ def main():
         piko_tag = get_latest_piko_tag(is_pre)
         print(f"  -> [INFO] Downloading Piko patches Version: {piko_tag}")
         download_release_asset("crimera/piko", r".*\.mpp$", "bins", "patches.mpp", include_prereleases=is_pre, version=piko_tag)
-        
+
+        patches_list = fetch_patches_list(piko_tag)
+        twitter_catalog = get_patch_catalog(patches_list, "com.twitter.android")
+        if twitter_catalog:
+            print(f"  -> [INFO] Patch metadata loaded: Old={len(twitter_catalog['old'])}, "
+                  f"NewX={len(twitter_catalog['newx'])}, Common={len(twitter_catalog['common'])}")
+        else:
+            print("  -> [WARNING] Patch metadata unavailable. Falling back to CLI listing (families may mix).")
+
         print("\n[STEP 2] Preparing build tools...")
         print("  -> [INFO] Downloading external build tools (APKEditor, Morphe CLI)...")
         download_apkeditor()
@@ -131,7 +194,7 @@ def main():
             filename = os.path.basename(file_path).lower()
             version_str = extract_version_from_filename(filename)
             
-            if "twitter" in filename or "x-" in filename or "x_" in filename:
+            if is_twitter_filename(filename):
                 print(f"\n[STEP 3] Processing Twitter/X: {filename} (Detected v{version_str})")
                 is_apkm = filename.endswith((".apkm", ".apks", ".xapk"))
                 working_file = "big_file.apkm" if is_apkm else "big_file_merged.apk"
@@ -163,20 +226,30 @@ def main():
                         shim_mpp = fetch_x_shim()
                         if shim_mpp: target_merged = apply_shim(cli_jar, shim_mpp, target_merged)
 
-                    print("  -> Building Twitter/X variants...")
-                    common_includes = get_target_patches(cli_jar, patch_mpp, "com.twitter.android", excludes=["Bring back twitter", "Dynamic color"])
-                    
-                    twitter_variants = [
-                        {"name": "X (Material You)", "output": f"x-piko-material-you-v{version_str}.apk", "includes": ["Dynamic color"], "excludes": []},
-                        {"name": "X (Standard)", "output": f"x-piko-v{version_str}.apk", "includes": [], "excludes": ["Dynamic color"]},
-                        {"name": "Twitter (Material You)", "output": f"twitter-piko-material-you-v{version_str}.apk", "includes": ["Bring back twitter", "Dynamic color"], "excludes": []},
-                        {"name": "Twitter (Standard)", "output": f"twitter-piko-v{version_str}.apk", "includes": ["Bring back twitter"], "excludes": ["Dynamic color"]}
-                    ]
+                    family = get_patch_family_for_version(twitter_catalog, version_str)
+                    family_label = "NewX" if family == "newx" else "Old"
+                    print(f"  -> [INFO] Patch family for v{version_str}: {family_label}")
+                    if twitter_catalog and not is_family_compatible(twitter_catalog, family, version_str):
+                        print(f"  -> [WARNING] v{version_str} is not a listed target version for "
+                              f"{family_label} patches. Applying anyway.")
 
-                    for variant in twitter_variants:
-                        final_includes = common_includes + variant["includes"]
-                        run_morphe_and_extract(cli_jar, patch_mpp, target_merged, variant["output"], final_includes, variant["excludes"])
-                    print(f"  -> [SUCCESS] Twitter/X variants saved to '{OUTPUT_DIR}'.")
+                    available = get_target_patches(cli_jar, patch_mpp, "com.twitter.android")
+                    base_includes, foreign_patches = build_patch_selection(twitter_catalog, available, family)
+
+                    toggles = [NEWX_BRANDING_PATCH] if family == "newx" else OLD_TOGGLE_PATCHES
+                    base_includes = [p for p in base_includes if p not in toggles]
+
+                    if not base_includes:
+                        print(f"  -> [WARNING] No {family_label} patches available for v{version_str}. Skipping.")
+                        continue
+
+                    print(f"  -> Building {family_label} variants ({len(base_includes)} base patches, "
+                          f"{len(foreign_patches)} patches excluded)...")
+                    for variant in build_twitter_variants(family, version_str):
+                        final_includes = base_includes + variant["includes"]
+                        final_excludes = variant["excludes"] + foreign_patches
+                        run_morphe_and_extract(cli_jar, patch_mpp, target_merged, variant["output"], final_includes, final_excludes)
+                    print(f"  -> [SUCCESS] {family_label} variants saved to '{OUTPUT_DIR}'.")
 
             elif "insta" in filename:
                 print(f"\n[STEP 3] Processing Instagram: {filename} (Detected v{version_str})")

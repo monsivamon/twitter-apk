@@ -66,7 +66,9 @@ def setup_environment():
             r"C:\Program Files\Eclipse Adoptium\jdk-21*\bin",
             r"C:\Program Files\Java\jdk-17*\bin",
             r"C:\Program Files\Java\jdk-21*\bin",
-            r"C:\Program Files\Amazon Corretto\jdk17*\bin"
+            r"C:\Program Files\Amazon Corretto\jdk17*\bin",
+            r"C:\Program Files\Android\Android Studio\jbr\bin",
+            r"C:\Program Files\Android\Android Studio*\jbr\bin",
         ]
         for pattern in search_patterns:
             matches = glob.glob(pattern)

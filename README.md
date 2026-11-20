@@ -50,6 +50,34 @@ python main_manual.py
 6. **Choose your desired execution mode from the interactive menu (e.g., `[1] Full Build`, `[4] Upload Only`).**
 7. Choose your target branch (Stable/Pre-release) when prompted. The script will automatically handle merging, shim application (if necessary), patching, signing (using `apksigner` and your `ks_pkcs12.keystore`), and creating/uploading the release to your own repository.
 
+## 🧩 Patch Families (Old / NewX)
+
+Piko ships two mutually exclusive patch families, and the builder never applies both to the same APK:
+
+| Family | Piko category | Target versions |
+|---|---|---|
+| Old | `Old patches` | 12.19.1 |
+| NewX | `NewX patches` | 12.41.0 / 12.43.0 |
+
+* The family is detected automatically from the base APK version, using `patches-list.json` from the same Piko tag as `patches.mpp`.
+* Patches without a family (currently `Disable Play Store updates`) are treated as **common** and applied to both families.
+* The other family's patches are always passed as explicit excludes, so a patch can never leak into the wrong build.
+* Because the families target different app versions, place the matching base APK (12.19.x for Old, 12.41/12.43 for NewX) in `.base_apk`.
+
+### Output variants
+
+Old patches (4 variants):
+
+* `x-piko-v{version}.apk`
+* `x-piko-material-you-v{version}.apk`
+* `twitter-piko-v{version}.apk`
+* `twitter-piko-material-you-v{version}.apk`
+
+NewX patches (2 variants):
+
+* `newx-piko-v{version}.apk` — keeps the X name and icon
+* `newx-piko-twitter-branding-v{version}.apk` — applies `NewX: Restore Twitter branding`
+
 ## 📥 Download
 
 If you just want the pre-built APKs, choose the version that best suits your needs:

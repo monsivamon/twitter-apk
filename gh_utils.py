@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import subprocess
 import pathlib
 
@@ -10,9 +11,9 @@ def check_github_repo_access(repo_name):
     if not repo_name:
         print("  -> [ERROR] GITHUB_REPO is not configured correctly.")
         return False
-    if not subprocess.run(["which", "gh"], capture_output=True).returncode == 0 and os.name != 'nt':
+    if not shutil.which("gh"):
         print("  -> [WARNING] GitHub CLI ('gh') is not installed. Uploading will be skipped.")
-        return True 
+        return True
     print(f"  -> Pinging repository: {repo_name} ...")
     res = subprocess.run(["gh", "repo", "view", repo_name], capture_output=True, text=True)
     if res.returncode != 0:

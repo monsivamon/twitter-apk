@@ -157,6 +157,160 @@ def get_target_patches(cli_path: str, mpp_path: str, target_package: str, exclud
                 applicable_patches.append(patch["name"])
     return applicable_patches
 
+# ---------------------------------------------------------------------------
+# Patch metadata (Old / NewX categories)
+# ---------------------------------------------------------------------------
+PATCHES_LIST_URL = "https://raw.githubusercontent.com/crimera/piko/{tag}/patches-list.json"
+OLD_CATEGORY = "Old patches"
+NEWX_CATEGORY = "NewX patches"
+NEWX_NAME_PREFIX = "NewX:"
+NEWX_BRANDING_PATCH = "NewX: Restore Twitter branding"
+PATCH_FAMILIES = ("old", "newx")
+
+def fetch_patches_list(tag: str):
+    """Download Piko's patches-list.json for the given tag (cached in bins/).
+
+    The CLI listing does not expose patch categories, but patches-list.json
+    does, which is what lets us keep Old and NewX patches apart.
+    """
+    os.makedirs(BINS_DIR, exist_ok=True)
+    safe_tag = re.sub(r'[^A-Za-z0-9._-]', '_', tag or 'latest')
+    cache_path = os.path.join(BINS_DIR, f"patches-list-{safe_tag}.json")
+
+    if os.path.exists(cache_path):
+        print(f"  -> [DEBUG] Patch metadata for {tag} already cached.")
+    else:
+        url = PATCHES_LIST_URL.format(tag=tag)
+        print(f"  -> Fetching patch metadata: {url}")
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                data = response.read()
+            with open(cache_path, 'wb') as f:
+                f.write(data)
+            print(f"  -> [SUCCESS] Downloaded patch metadata ({len(data)} bytes).")
+        except Exception as e:
+            print(f"  -> [WARNING] Failed to fetch patch metadata: {e}")
+            return None
+
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"  -> [WARNING] Failed to parse patch metadata: {e}")
+        return None
+
+def _version_key(version: str):
+    match = re.match(r'(\d+)\.(\d+)(?:\.(\d+))?', version or '')
+    if not match:
+        return None
+    return tuple(int(part) if part is not None else 0 for part in match.groups())
+
+def _version_matches(base_version: str, target_version: str) -> bool:
+    base = (base_version or '').split('-')[0]
+    target = (target_version or '').split('-')[0]
+    if not base or not target:
+        return False
+    return base == target
+
+def get_patch_catalog(patches_list, target_package: str):
+    """Group a package's patches into 'old', 'newx' and 'common' lists.
+
+    'common' holds patches that apply to both UI families (patches without a
+    category whose target versions span both families).
+    """
+    if not patches_list:
+        return None
+
+    entries = []
+    for patch in patches_list.get("patches", []):
+        versions = set()
+        applies = False
+        for package in (patch.get("compatiblePackages") or []):
+            if package.get("packageName") != target_package:
+                continue
+            applies = True
+            for target in (package.get("targets") or []):
+                if target.get("version"):
+                    versions.add(target["version"])
+        if applies:
+            entries.append({
+                "name": patch.get("name") or "",
+                "category": patch.get("category"),
+                "versions": versions,
+            })
+
+    if not entries:
+        return None
+
+    old_versions, newx_versions = set(), set()
+    for entry in entries:
+        if entry["category"] == OLD_CATEGORY:
+            old_versions |= entry["versions"]
+        elif entry["category"] == NEWX_CATEGORY:
+            newx_versions |= entry["versions"]
+    has_categories = bool(old_versions or newx_versions)
+
+    catalog = {
+        "old": [], "newx": [], "common": [],
+        "versions": {},
+        "family_versions": {"old": set(), "newx": set()},
+    }
+
+    for entry in entries:
+        name, category, versions = entry["name"], entry["category"], entry["versions"]
+        if category == NEWX_CATEGORY or name.startswith(NEWX_NAME_PREFIX):
+            family = "newx"
+        elif category == OLD_CATEGORY:
+            family = "old"
+        elif has_categories and (versions & old_versions) and (versions & newx_versions):
+            family = "common"
+        elif has_categories and (versions & newx_versions) and not (versions & old_versions):
+            family = "newx"
+        else:
+            family = "old"
+
+        catalog[family].append(name)
+        catalog["versions"][name] = versions
+        if family != "common":
+            catalog["family_versions"][family] |= versions
+
+    return catalog
+
+def get_patch_family_for_version(catalog, version: str) -> str:
+    """Return the patch family ('old' or 'newx') matching a base APK version."""
+    if not catalog:
+        return "old"
+
+    matches = [
+        family for family in PATCH_FAMILIES
+        if any(_version_matches(version, v) for v in catalog["family_versions"][family])
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return "newx"
+
+    # No exact match: anything older than the oldest NewX target stays Old,
+    # anything newer is treated as NewX.
+    base_key = _version_key(version)
+    newx_keys = [k for k in (_version_key(v) for v in catalog["family_versions"]["newx"]) if k]
+    if base_key and newx_keys and base_key >= min(newx_keys):
+        return "newx"
+    return "old"
+
+def get_family_patches(catalog, family: str) -> list:
+    """Patches to apply for a family, including the shared (common) ones."""
+    if not catalog:
+        return []
+    return list(catalog.get(family, [])) + list(catalog.get("common", []))
+
+def is_family_compatible(catalog, family: str, version: str) -> bool:
+    """True when the version is one of the family's declared target versions."""
+    if not catalog:
+        return False
+    return any(_version_matches(version, v) for v in catalog["family_versions"][family])
+
 def run_morphe_and_extract(cli_jar, patch_mpp, input_apk, output_apk_name, includes, excludes):
     cmd = [
         "java", "-jar", cli_jar, "patch",
